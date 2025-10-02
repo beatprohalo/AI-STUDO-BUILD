@@ -17,6 +17,7 @@ export interface Track {
   status: TaskStatus;
   tags: string[];
   url?: string; // Optional temporary URL for playback
+  fileObject?: File; // Reference to original file for cleanup
 }
 
 // Fix: Add missing InputMode enum.

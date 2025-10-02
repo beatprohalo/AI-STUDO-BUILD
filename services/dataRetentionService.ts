@@ -49,9 +49,9 @@ class DataRetentionService {
     try {
       const dataString = JSON.stringify(this.retentionData);
       
-      // Check localStorage quota before saving
+      // Check localStorage quota before saving - more aggressive limits
       const quotaEstimate = this.estimateStorageSize();
-      if (quotaEstimate > 4.5 * 1024 * 1024) { // 4.5MB limit (conservative)
+      if (quotaEstimate > 2 * 1024 * 1024) { // 2MB limit (more conservative)
         console.warn('Data retention approaching localStorage limit. Cleaning up old data...');
         this.cleanupOldData();
       }
@@ -78,16 +78,16 @@ class DataRetentionService {
   }
 
   private cleanupOldData(): void {
-    // Keep only the most recent 500 items and remove items older than 30 days
-    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    // More aggressive cleanup: Keep only the most recent 200 items and remove items older than 7 days
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     
     // Filter out old data
-    this.retentionData = this.retentionData.filter(item => item.timestamp > thirtyDaysAgo);
+    this.retentionData = this.retentionData.filter(item => item.timestamp > sevenDaysAgo);
     
-    // If still too many items, keep only the most recent 500
-    if (this.retentionData.length > 500) {
+    // If still too many items, keep only the most recent 200
+    if (this.retentionData.length > 200) {
       this.retentionData.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-      this.retentionData = this.retentionData.slice(0, 500);
+      this.retentionData = this.retentionData.slice(0, 200);
     }
     
     console.log(`[Data Retention] Cleaned up data, now have ${this.retentionData.length} items`);

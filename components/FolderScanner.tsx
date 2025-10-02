@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { IconFolder, IconMusic, IconWaveform, IconLoader, IconX, IconCheck, IconAlert } from './Icon';
+import { Loader } from './Loader';
 
 interface ScannedFile {
     name: string;
@@ -86,6 +87,22 @@ export const FolderScanner: React.FC<FolderScannerProps> = ({ onFilesScanned, on
         setScanProgress('Scanning directory...');
 
         try {
+            // Add a small delay to allow UI to update
+            await new Promise(resolve => setTimeout(resolve, 100));
+            
+            setScanProgress('Initializing scan...');
+            
+            // Use requestIdleCallback to yield control to the UI
+            await new Promise(resolve => {
+                if (window.requestIdleCallback) {
+                    window.requestIdleCallback(resolve);
+                } else {
+                    setTimeout(resolve, 0);
+                }
+            });
+            
+            setScanProgress('Scanning files...');
+            
             const files = await invoke<ScannedFile[]>('scan_directory_for_audio_files', {
                 directoryPath: selectedFolder
             });
@@ -171,9 +188,19 @@ export const FolderScanner: React.FC<FolderScannerProps> = ({ onFilesScanned, on
                     </div>
 
                     {/* Progress/Error Display */}
-                    {scanProgress && (
+                    {isScanning && (
                         <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
-                            <p className="text-blue-700 dark:text-blue-300 flex items-center gap-2">
+                            <div className="flex items-center gap-2">
+                                <IconLoader className="w-4 h-4 animate-spin" />
+                                <p className="text-blue-700 dark:text-blue-300">
+                                    {scanProgress || 'Scanning directory...'}
+                                </p>
+                            </div>
+                        </div>
+                    )}
+                    {scanProgress && !isScanning && (
+                        <div className="mb-4 p-3 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded-lg">
+                            <p className="text-green-700 dark:text-green-300 flex items-center gap-2">
                                 <IconCheck className="w-4 h-4" />
                                 {scanProgress}
                             </p>

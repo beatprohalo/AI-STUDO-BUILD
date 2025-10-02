@@ -5,6 +5,7 @@ import { dataRetentionService } from '../services/dataRetentionService';
 import { addTrainingDataBank, getTrainingDataBanks, deleteTrainingDataBank, addTrainingFile, getTrainingFiles, deleteTrainingFile } from '../services/dbService';
 import { midiAnalysisService, MIDIAnalysis } from '../services/midiAnalysisService';
 import { AppSettings, AIProvider } from '../types';
+import { yieldToUI, processFilesAsync } from '../utils/asyncUtils';
 
 interface TrainingDataBank {
     id: string;
@@ -201,46 +202,45 @@ export const AIModelStudioView: React.FC<{ settings: AppSettings }> = ({ setting
         saveTrainingData();
     }, [saveTrainingData]);
 
-    const handleFileChange = (files: FileList | null) => {
+    const handleFileChange = async (files: FileList | null) => {
         console.log('File change triggered:', files);
         if (!files) return;
         
         setIsProcessingFiles(true);
         
-        const newFiles = Array.from(files)
-            .filter(file => /\.(mid|midi)$/i.test(file.name));
+        try {
+            const newFiles = Array.from(files)
+                .filter(file => /\.(mid|midi)$/i.test(file.name));
 
-        console.log(`Filtered ${newFiles.length} MIDI files from ${files.length} total files`);
+            console.log(`Filtered ${newFiles.length} MIDI files from ${files.length} total files`);
 
-        const existingFileNames = new Set(trainingFiles.map(f => f.name));
-        const uniqueNewFiles = newFiles.filter(nf => !existingFileNames.has(nf.name));
+            const existingFileNames = new Set(trainingFiles.map(f => f.name));
+            const uniqueNewFiles = newFiles.filter(nf => !existingFileNames.has(nf.name));
 
-        console.log(`Adding ${uniqueNewFiles.length} unique new files to existing ${trainingFiles.length} files`);
-        
-        // Process files in batches to avoid memory issues
-        const batchSize = 50;
-        const processBatch = (startIndex: number) => {
-            const batch = uniqueNewFiles.slice(startIndex, startIndex + batchSize);
-            if (batch.length > 0) {
-                setTrainingFiles(prev => [...prev, ...batch]);
-                if (startIndex + batchSize < uniqueNewFiles.length) {
-                    setTimeout(() => processBatch(startIndex + batchSize), 100);
-                }
+            console.log(`Adding ${uniqueNewFiles.length} unique new files to existing ${trainingFiles.length} files`);
+            
+            // Process files using utility function for better async handling
+            const allNewFiles = await processFilesAsync(
+                uniqueNewFiles,
+                async (file) => {
+                    await yieldToUI(5); // Yield control to UI
+                    return file;
+                },
+                25 // batch size
+            );
+            
+            // Update training files state
+            setTrainingFiles(prev => [...prev, ...allNewFiles]);
+            
+            // Create temporary bank for uploaded files
+            if (allNewFiles.length > 0) {
+                createTemporaryBank([...trainingFiles, ...allNewFiles]);
             }
-        };
-        
-        if (uniqueNewFiles.length <= batchSize) {
-            setTrainingFiles(prev => [...prev, ...uniqueNewFiles]);
-        } else {
-            processBatch(0);
+        } catch (error) {
+            console.error('Error processing files:', error);
+        } finally {
+            setIsProcessingFiles(false);
         }
-        
-        // Create temporary bank for uploaded files immediately
-        if (uniqueNewFiles.length > 0) {
-            createTemporaryBank([...trainingFiles, ...uniqueNewFiles]);
-        }
-        
-        setTimeout(() => setIsProcessingFiles(false), 500);
     };
 
     const handleFolderUpload = (files: FileList | null) => {

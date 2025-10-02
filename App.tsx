@@ -22,6 +22,8 @@ import { NotesView } from './components/NotesView';
 import { Player } from './components/Player';
 import { AutoSorterView } from './components/AutoSorterView';
 import { ScreenInfoView } from './components/ScreenInfoView';
+import { yieldToUI, processInBatches } from './utils/asyncUtils';
+import { MemoryManager, createTrackWithMemoryManagement } from './utils/memoryUtils';
 import { initDB, getTracks, addTracks, updateTrack, getNotes, addNote, addNotes, getSamples, addSamples, getPlugins, addPlugins, getProjectEvents, addProjectEvents, getAllDataForBackup, restoreDataFromBackup } from './services/dbService';
 import { dataRetentionService } from './services/dataRetentionService';
 import { exportToCSV, exportToJSON } from './services/exportService';
@@ -32,6 +34,7 @@ import { sendMessageToGemma, findSyncMatches as findSyncMatchesGemma, autoTagTra
 import { algorithmicTaggingService } from './services/algorithmicTaggingService';
 import { BackupRestoreView } from './components/BackupRestoreView';
 import { AIModelStudioView } from './components/AIModelStudioView';
+import { MemoryMonitor } from './components/MemoryMonitor';
 
 // Development state persistence for hot reloads
 const DEV_STATE_KEY = 'aistudio_dev_state';
@@ -126,6 +129,7 @@ const App: React.FC = () => {
   const [musicalIdea, setMusicalIdea] = useState<MusicalIdea | null>(null);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [scanProgress, setScanProgress] = useState<string>('');
   const [isAnalyzing, setIsAnalyzing] = useState<boolean>(false);
   const [activeView, setActiveView] = useState<View>(savedDevState?.activeView || 'dashboard');
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
@@ -235,6 +239,8 @@ const App: React.FC = () => {
         if (saveTimeoutRef.current) {
             clearTimeout(saveTimeoutRef.current);
         }
+        // Clean up memory on component unmount
+        MemoryManager.cleanupAllURLs();
     }
   }, [loadAllDataFromDB]);
 
@@ -309,53 +315,101 @@ const App: React.FC = () => {
         }
     }, [handleReminders, settings.reminderInterval]);
 
+  // Memory monitoring and cleanup
+  useEffect(() => {
+    const memoryCleanupInterval = setInterval(() => {
+      MemoryManager.monitorMemoryUsage();
+      // Auto-cleanup if memory usage is too high
+      MemoryManager.autoCleanupIfNeeded();
+      // Clean up unused URLs every 5 minutes
+      MemoryManager.cleanupTracks(tracks);
+    }, 2 * 60 * 1000); // 2 minutes (more frequent)
+
+    return () => clearInterval(memoryCleanupInterval);
+  }, [tracks]);
+
   const handleDirectoryChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const files = event.target.files;
     if (!files || files.length === 0) return;
 
     setIsScanning(true);
     
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    const audioFiles = Array.from(files as FileList).filter((file: File) => /\.(wav|mp3|aiff)$/i.test(file.name));
-    
-    const newTracks: Track[] = audioFiles.map((file: File) => ({
-      id: (file as any).webkitRelativePath || file.name,
-      name: file.name,
-      path: (file as any).webkitRelativePath || file.name,
-      genre: '',
-      mood: '',
-      key: '',
-      bpm: 120,
-      notes: '',
-      tags: [],
-      status: { mixed: false, mastered: false, tagged: false, registered: false },
-      url: URL.createObjectURL(file), // Create a temporary URL for playback
-    }));
-
-    const existingTrackIds = new Set(tracks.map(t => t.id));
-    const uniqueNewTracks = newTracks.filter(t => !existingTrackIds.has(t.id));
-    
-    if (uniqueNewTracks.length > 0) {
-        try {
-            await addTracks(uniqueNewTracks);
-            const updatedTracks = [...tracks, ...uniqueNewTracks];
-            setTracks(updatedTracks);
-            
-            // Retain scan results
-            dataRetentionService.retainScanResult(
-              'audio_scan',
-              audioFiles,
-              uniqueNewTracks.map(t => ({ id: t.id, name: t.name, path: t.path }))
-            );
-        } catch(e) {
-            console.error("Failed to add tracks to database", e);
-            setError("Could not save new tracks.");
+    try {
+      setScanProgress('Filtering audio files...');
+      
+      // Yield control to the UI
+      await yieldToUI();
+      
+      const audioFiles = Array.from(files as FileList).filter((file: File) => /\.(wav|mp3|aiff)$/i.test(file.name));
+      
+      setScanProgress(`Processing ${audioFiles.length} files...`);
+      
+      // Process files in batches using utility function
+      const newTracks = await processInBatches(
+        audioFiles,
+        50, // batch size
+        async (batch) => {
+          return batch.map((file: File) => createTrackWithMemoryManagement(file, {
+            id: (file as any).webkitRelativePath || file.name,
+            name: file.name,
+            path: (file as any).webkitRelativePath || file.name,
+            genre: '',
+            mood: '',
+            key: '',
+            bpm: 120,
+            notes: '',
+            tags: [],
+            status: { mixed: false, mastered: false, tagged: false, registered: false }
+          }));
+        },
+        (processed, total) => {
+          setScanProgress(`Processed ${processed} of ${total} files...`);
         }
-    }
+      );
 
-    setIsScanning(false);
-    event.target.value = '';
+      setScanProgress('Checking for duplicates...');
+      const existingTrackIds = new Set(tracks.map(t => t.id));
+      const uniqueNewTracks = newTracks.flat().filter(t => !existingTrackIds.has(t.id));
+      
+      if (uniqueNewTracks.length > 0) {
+          try {
+              setScanProgress(`Adding ${uniqueNewTracks.length} tracks to database...`);
+              
+              // Process database operations in batches using utility function
+              await processInBatches(
+                uniqueNewTracks,
+                100, // database batch size
+                async (batch) => {
+                  await addTracks(batch);
+                },
+                (processed, total) => {
+                  setScanProgress(`Added ${processed} of ${total} tracks to database...`);
+                }
+              );
+              
+              const updatedTracks = [...tracks, ...uniqueNewTracks];
+              setTracks(updatedTracks);
+              
+              // Retain scan results
+              dataRetentionService.retainScanResult(
+                'audio_scan',
+                audioFiles,
+                uniqueNewTracks.map(t => ({ id: t.id, name: t.name, path: t.path }))
+              );
+          } catch(e) {
+              console.error("Failed to add tracks to database", e);
+              setError("Could not save new tracks.");
+          }
+      }
+
+      setScanProgress('Complete!');
+    } catch (error) {
+      console.error("Error processing files:", error);
+      setError("Failed to process files.");
+    } finally {
+      setIsScanning(false);
+      event.target.value = '';
+    }
   };
 
   const handleUpdateTrack = async (updatedTrack: Track) => {
@@ -367,6 +421,8 @@ const App: React.FC = () => {
         await updateTrack(updatedTrack);
         setTracks(prevTracks => {
           const updatedTracks = prevTracks.map(t => t.id === updatedTrack.id ? updatedTrack : t);
+          // Clean up unused URLs when tracks are updated
+          MemoryManager.cleanupTracks(updatedTracks);
           return updatedTracks;
         });
         setSaveStatus('saved');
@@ -383,68 +439,78 @@ const App: React.FC = () => {
   const handleFilesScanned = async (scannedFiles: { name: string; path: string; file_type: string; size: number }[]) => {
     setIsScanning(true);
     
-    try {
-      // Convert scanned files to Track objects
-      const newTracks: Track[] = scannedFiles
-        .filter(file => file.file_type === 'audio')
-        .map(file => ({
-          id: file.path,
-          name: file.name,
-          path: file.path,
-          genre: '',
-          mood: '',
-          key: '',
-          bpm: 120,
-          notes: '',
-          tags: [],
-          status: { mixed: false, mastered: false, tagged: false, registered: false },
-        }));
+    // Process files asynchronously to prevent UI blocking
+    setTimeout(async () => {
+      try {
+        setScanProgress('Converting files to tracks...');
+        // Convert scanned files to Track objects
+        const newTracks: Track[] = scannedFiles
+          .filter(file => file.file_type === 'audio')
+          .map(file => ({
+            id: file.path,
+            name: file.name,
+            path: file.path,
+            genre: '',
+            mood: '',
+            key: '',
+            bpm: 120,
+            notes: '',
+            tags: [],
+            status: { mixed: false, mastered: false, tagged: false, registered: false },
+          }));
 
-      // Convert scanned files to Sample objects
-      const newSamples: Sample[] = scannedFiles
-        .filter(file => file.file_type === 'midi')
-        .map(file => ({
-          id: file.path,
-          name: file.name,
-          path: file.path,
-          tags: [],
-        }));
+        // Convert scanned files to Sample objects
+        const newSamples: Sample[] = scannedFiles
+          .filter(file => file.file_type === 'midi')
+          .map(file => ({
+            id: file.path,
+            name: file.name,
+            path: file.path,
+            tags: [],
+          }));
 
-      // Add tracks to database
-      if (newTracks.length > 0) {
-        const existingTrackIds = new Set(tracks.map(t => t.id));
-        const uniqueNewTracks = newTracks.filter(t => !existingTrackIds.has(t.id));
-        
-        if (uniqueNewTracks.length > 0) {
-          await addTracks(uniqueNewTracks);
-          setTracks(prevTracks => [...prevTracks, ...uniqueNewTracks]);
+        // Add tracks to database
+        if (newTracks.length > 0) {
+          setScanProgress('Checking for duplicate tracks...');
+          const existingTrackIds = new Set(tracks.map(t => t.id));
+          const uniqueNewTracks = newTracks.filter(t => !existingTrackIds.has(t.id));
+          
+          if (uniqueNewTracks.length > 0) {
+            setScanProgress(`Adding ${uniqueNewTracks.length} tracks to database...`);
+            await addTracks(uniqueNewTracks);
+            setTracks(prevTracks => [...prevTracks, ...uniqueNewTracks]);
+          }
         }
-      }
 
-      // Add samples to database
-      if (newSamples.length > 0) {
-        const existingSampleIds = new Set(samples.map(s => s.id));
-        const uniqueNewSamples = newSamples.filter(s => !existingSampleIds.has(s.id));
-        
-        if (uniqueNewSamples.length > 0) {
-          await addSamples(uniqueNewSamples);
-          setSamples(prevSamples => [...prevSamples, ...uniqueNewSamples]);
+        // Add samples to database
+        if (newSamples.length > 0) {
+          setScanProgress('Checking for duplicate samples...');
+          const existingSampleIds = new Set(samples.map(s => s.id));
+          const uniqueNewSamples = newSamples.filter(s => !existingSampleIds.has(s.id));
+          
+          if (uniqueNewSamples.length > 0) {
+            setScanProgress(`Adding ${uniqueNewSamples.length} samples to database...`);
+            await addSamples(uniqueNewSamples);
+            setSamples(prevSamples => [...prevSamples, ...uniqueNewSamples]);
+          }
         }
+
+        // Retain scan results
+        setScanProgress('Saving scan results...');
+        dataRetentionService.retainScanResult(
+          'folder_scan',
+          scannedFiles,
+          [...newTracks, ...newSamples].map(item => ({ id: item.id, name: item.name, path: item.path }))
+        );
+
+        setScanProgress('Complete!');
+      } catch(e) {
+        console.error("Failed to process scanned files", e);
+        setError("Could not process scanned files.");
+      } finally {
+        setIsScanning(false);
       }
-
-      // Retain scan results
-      dataRetentionService.retainScanResult(
-        'folder_scan',
-        scannedFiles,
-        [...newTracks, ...newSamples].map(item => ({ id: item.id, name: item.name, path: item.path }))
-      );
-
-    } catch(e) {
-      console.error("Failed to process scanned files", e);
-      setError("Could not process scanned files.");
-    } finally {
-      setIsScanning(false);
-    }
+    }, 0);
   };
   
   const handleDailySummary = () => {
@@ -786,7 +852,7 @@ const App: React.FC = () => {
             // Use algorithmic tagging instead of LLM-based tagging
             trackData = await algorithmicTaggingService.autoTagTrack(file);
             
-            const newTrack: Track = {
+            const newTrack: Track = createTrackWithMemoryManagement(file, {
                 id: file.name,
                 name: file.name,
                 path: file.name,
@@ -796,9 +862,8 @@ const App: React.FC = () => {
                 bpm: trackData.bpm || 120,
                 notes: `Auto-tagged on ${new Date().toLocaleDateString()}`,
                 status: { mixed: false, mastered: false, tagged: true, registered: false },
-                tags: trackData.tags || [],
-                url: URL.createObjectURL(file),
-            };
+                tags: trackData.tags || []
+            });
             await addTracks([newTrack]);
             setTracks(prev => [...prev, newTrack]);
             resultData = newTrack;
@@ -811,7 +876,7 @@ const App: React.FC = () => {
                 name: file.name,
                 path: file.name,
                 tags: sampleTags,
-                url: URL.createObjectURL(file),
+                url: MemoryManager.createTrackedURL(file),
             };
             await addSamples([newSample]);
             setSamples(prev => [...prev, newSample]);
@@ -1103,6 +1168,18 @@ const App: React.FC = () => {
         <main className="lg:col-span-10">
           {renderView()}
         </main>
+        
+        {/* Global Loading Overlay for File Scanning */}
+        {isScanning && (
+          <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50">
+            <div className="bg-white dark:bg-gray-800 rounded-2xl p-8 max-w-md mx-4 text-center">
+              <Loader />
+              <p className="mt-4 text-gray-600 dark:text-gray-300">
+                {scanProgress || 'Processing audio and MIDI files...'}
+              </p>
+            </div>
+          </div>
+        )}
       </div>
       <Player
         track={currentlyPlaying}
@@ -1114,6 +1191,7 @@ const App: React.FC = () => {
         onSeek={handleSeek}
       />
       <input type="file" ref={restoreInputRef} onChange={handleRestore} accept=".json" className="hidden" />
+      <MemoryMonitor />
     </div>
   );
 };

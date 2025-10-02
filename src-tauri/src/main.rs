@@ -89,6 +89,7 @@ struct ScannedFile {
 async fn scan_directory_for_audio_files(directory_path: String) -> Result<Vec<ScannedFile>, String> {
     use std::fs;
     use std::path::Path;
+    use tokio::task;
     
     let path = Path::new(&directory_path);
     if !path.exists() {
@@ -99,50 +100,58 @@ async fn scan_directory_for_audio_files(directory_path: String) -> Result<Vec<Sc
         return Err("Path is not a directory".to_string());
     }
     
-    let mut audio_files = Vec::new();
     let audio_extensions = ["wav", "mp3", "aiff", "flac", "m4a", "aac", "ogg", "wma"];
     let midi_extensions = ["mid", "midi"];
     
-    fn scan_recursive(dir: &Path, audio_files: &mut Vec<ScannedFile>, audio_extensions: &[&str], midi_extensions: &[&str]) -> Result<(), String> {
-        let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read directory: {}", e))?;
+    // Run the scanning in a separate thread to prevent blocking the main thread
+    let result = task::spawn_blocking(move || {
+        let mut audio_files = Vec::new();
         
-        for entry in entries {
-            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-            let path = entry.path();
+        fn scan_recursive(dir: &Path, audio_files: &mut Vec<ScannedFile>, audio_extensions: &[&str], midi_extensions: &[&str]) -> Result<(), String> {
+            let entries = fs::read_dir(dir).map_err(|e| format!("Failed to read directory: {}", e))?;
             
-            if path.is_dir() {
-                scan_recursive(&path, audio_files, audio_extensions, midi_extensions)?;
-            } else if path.is_file() {
-                if let Some(extension) = path.extension() {
-                    let ext_str = extension.to_string_lossy().to_lowercase();
-                    
-                    if audio_extensions.contains(&ext_str.as_str()) || midi_extensions.contains(&ext_str.as_str()) {
-                        let metadata = fs::metadata(&path).map_err(|e| format!("Failed to get file metadata: {}", e))?;
-                        let file_size = metadata.len();
+            for entry in entries {
+                let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+                let path = entry.path();
+                
+                if path.is_dir() {
+                    // Limit recursion depth to prevent excessive scanning
+                    if audio_files.len() < 10000 { // Reasonable limit to prevent UI blocking
+                        scan_recursive(&path, audio_files, audio_extensions, midi_extensions)?;
+                    }
+                } else if path.is_file() {
+                    if let Some(extension) = path.extension() {
+                        let ext_str = extension.to_string_lossy().to_lowercase();
                         
-                        let file_type = if audio_extensions.contains(&ext_str.as_str()) {
-                            "audio".to_string()
-                        } else {
-                            "midi".to_string()
-                        };
-                        
-                        audio_files.push(ScannedFile {
-                            name: path.file_name().unwrap().to_string_lossy().to_string(),
-                            path: path.to_string_lossy().to_string(),
-                            file_type,
-                            size: file_size,
-                        });
+                        if audio_extensions.contains(&ext_str.as_str()) || midi_extensions.contains(&ext_str.as_str()) {
+                            let metadata = fs::metadata(&path).map_err(|e| format!("Failed to get file metadata: {}", e))?;
+                            let file_size = metadata.len();
+                            
+                            let file_type = if audio_extensions.contains(&ext_str.as_str()) {
+                                "audio".to_string()
+                            } else {
+                                "midi".to_string()
+                            };
+                            
+                            audio_files.push(ScannedFile {
+                                name: path.file_name().unwrap().to_string_lossy().to_string(),
+                                path: path.to_string_lossy().to_string(),
+                                file_type,
+                                size: file_size,
+                            });
+                        }
                     }
                 }
             }
+            
+            Ok(())
         }
         
-        Ok(())
-    }
+        scan_recursive(&path, &mut audio_files, &audio_extensions, &midi_extensions)?;
+        Ok(audio_files)
+    }).await.map_err(|e| format!("Task failed: {}", e))?;
     
-    scan_recursive(path, &mut audio_files, &audio_extensions, &midi_extensions)?;
-    
-    Ok(audio_files)
+    result
 }
 
 fn main() {
