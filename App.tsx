@@ -439,78 +439,94 @@ const App: React.FC = () => {
   const handleFilesScanned = async (scannedFiles: { name: string; path: string; file_type: string; size: number }[]) => {
     setIsScanning(true);
     
-    // Process files asynchronously to prevent UI blocking
-    setTimeout(async () => {
-      try {
-        setScanProgress('Converting files to tracks...');
-        // Convert scanned files to Track objects
-        const newTracks: Track[] = scannedFiles
-          .filter(file => file.file_type === 'audio')
-          .map(file => ({
-            id: file.path,
-            name: file.name,
-            path: file.path,
-            genre: '',
-            mood: '',
-            key: '',
-            bpm: 120,
-            notes: '',
-            tags: [],
-            status: { mixed: false, mastered: false, tagged: false, registered: false },
-          }));
+    try {
+      // Step 1: Separate audio and MIDI files
+      setScanProgress('Categorizing scanned files...');
+      await yieldToUI();
+      const audioFileInfos = scannedFiles.filter(f => f.file_type === 'audio');
+      const midiFileInfos = scannedFiles.filter(f => f.file_type === 'midi');
 
-        // Convert scanned files to Sample objects
-        const newSamples: Sample[] = scannedFiles
-          .filter(file => file.file_type === 'midi')
-          .map(file => ({
-            id: file.path,
-            name: file.name,
-            path: file.path,
-            tags: [],
-          }));
+      // Step 2: Process and add new tracks in batches
+      if (audioFileInfos.length > 0) {
+        const existingTrackIds = new Set(tracks.map(t => t.id));
+        const uniqueNewAudioInfos = audioFileInfos.filter(info => !existingTrackIds.has(info.path));
 
-        // Add tracks to database
-        if (newTracks.length > 0) {
-          setScanProgress('Checking for duplicate tracks...');
-          const existingTrackIds = new Set(tracks.map(t => t.id));
-          const uniqueNewTracks = newTracks.filter(t => !existingTrackIds.has(t.id));
-          
-          if (uniqueNewTracks.length > 0) {
-            setScanProgress(`Adding ${uniqueNewTracks.length} tracks to database...`);
-            await addTracks(uniqueNewTracks);
-            setTracks(prevTracks => [...prevTracks, ...uniqueNewTracks]);
-          }
+        if (uniqueNewAudioInfos.length > 0) {
+          const newTracks = await processInBatches(
+            uniqueNewAudioInfos,
+            50, // batch size for object creation
+            async (batch) => batch.map(info => ({
+              id: info.path,
+              name: info.name,
+              path: info.path,
+              genre: '',
+              mood: '',
+              key: '',
+              bpm: 120,
+              notes: '',
+              tags: [],
+              status: { mixed: false, mastered: false, tagged: false, registered: false },
+            })),
+            (processed, total) => setScanProgress(`Creating track objects: ${processed}/${total}`)
+          );
+
+          await processInBatches(
+            newTracks.flat(),
+            100, // batch size for DB operations
+            async (batch) => {
+              await addTracks(batch);
+              setTracks(prev => [...prev, ...batch]);
+            },
+            (processed, total) => setScanProgress(`Adding tracks to database: ${processed}/${total}`)
+          );
         }
-
-        // Add samples to database
-        if (newSamples.length > 0) {
-          setScanProgress('Checking for duplicate samples...');
-          const existingSampleIds = new Set(samples.map(s => s.id));
-          const uniqueNewSamples = newSamples.filter(s => !existingSampleIds.has(s.id));
-          
-          if (uniqueNewSamples.length > 0) {
-            setScanProgress(`Adding ${uniqueNewSamples.length} samples to database...`);
-            await addSamples(uniqueNewSamples);
-            setSamples(prevSamples => [...prevSamples, ...uniqueNewSamples]);
-          }
-        }
-
-        // Retain scan results
-        setScanProgress('Saving scan results...');
-        dataRetentionService.retainScanResult(
-          'folder_scan',
-          scannedFiles,
-          [...newTracks, ...newSamples].map(item => ({ id: item.id, name: item.name, path: item.path }))
-        );
-
-        setScanProgress('Complete!');
-      } catch(e) {
-        console.error("Failed to process scanned files", e);
-        setError("Could not process scanned files.");
-      } finally {
-        setIsScanning(false);
       }
-    }, 0);
+
+      // Step 3: Process and add new samples in batches
+      if (midiFileInfos.length > 0) {
+        const existingSampleIds = new Set(samples.map(s => s.id));
+        const uniqueNewMidiInfos = midiFileInfos.filter(info => !existingSampleIds.has(info.path));
+
+        if (uniqueNewMidiInfos.length > 0) {
+          const newSamples = await processInBatches(
+            uniqueNewMidiInfos,
+            50, // batch size for object creation
+            async (batch) => batch.map(info => ({
+              id: info.path,
+              name: info.name,
+              path: info.path,
+              tags: [],
+            })),
+            (processed, total) => setScanProgress(`Creating sample objects: ${processed}/${total}`)
+          );
+
+          await processInBatches(
+            newSamples.flat(),
+            100, // batch size for DB operations
+            async (batch) => {
+              await addSamples(batch);
+              setSamples(prev => [...prev, ...batch]);
+            },
+            (processed, total) => setScanProgress(`Adding samples to database: ${processed}/${total}`)
+          );
+        }
+      }
+
+      // Step 4: Retain scan results
+      setScanProgress('Finalizing scan...');
+      await yieldToUI();
+      const allNewItems = [...audioFileInfos, ...midiFileInfos].map(item => ({ id: item.path, name: item.name, path: item.path }));
+      dataRetentionService.retainScanResult('folder_scan', scannedFiles, allNewItems);
+
+      setScanProgress('Complete!');
+
+    } catch (e) {
+      console.error("Failed to process scanned files", e);
+      setError("Could not process scanned files.");
+    } finally {
+      // Add a small delay before hiding the loader to show the "Complete!" message
+      setTimeout(() => setIsScanning(false), 500);
+    }
   };
   
   const handleDailySummary = () => {
