@@ -1,0 +1,8 @@
+{
+  "name": "Music Organizer Assistant",
+  "description": "A smart desktop app for music producers to organize their music catalog, tasks, and metadata — with voice reminders and AI suggestions.",
+  "main": "index.html",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
